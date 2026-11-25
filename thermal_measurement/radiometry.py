@@ -1,45 +1,37 @@
-"""SDK-free DJI R-JPEG float32 measurement."""
+"""SDK-free DJI R-JPEG float32 measurement using object-oriented handlers."""
 
 import argparse
-from pathlib import Path
 import sys
+from pathlib import Path
 
-if __package__:
-    from .dirp_radiance import measure_dirp
-    from .girp_radiance import measure_girp
-    from .hirp_rjpeg import measure_hirp
-    from .iirp_rjpeg import _jpeg_segments, measure_float32 as measure_iirp
-    from .xts_radiance import measure_xts
-else:
-    from dirp_radiance import measure_dirp
-    from girp_radiance import measure_girp
-    from hirp_rjpeg import measure_hirp
-    from iirp_rjpeg import _jpeg_segments, measure_float32 as measure_iirp
-    from xts_radiance import measure_xts
+from .dirp_radiance import DirpHandler
+from .girp_radiance import GirpHandler
+from .hirp_rjpeg import HirpHandler
+from .iirp_rjpeg import IirpHandler, _jpeg_segments
+from .xts_radiance import ThermalArray, XtsHandler
 
 
-def measure_float32(data):
+def measure_float32(data: bytes) -> tuple[ThermalArray, tuple[int, int]]:
     """Measure R-JPEG bytes and return (temperatures, (height, width)).
 
-    Temperatures are a row-major array('f') in degrees Celsius.
+    Temperatures are a row-major ThermalArray (NumPy float32 ndarray) in degrees Celsius.
     """
     segments = list(_jpeg_segments(data))
-    if any(marker == 0xE2 and payload.startswith(b"Plug") for marker, payload in segments):
-        return measure_xts(segments)
-    if any(marker == 0xE4 and payload.startswith(b"\xff\xd2\xd1\xffgirp")
-           for marker, payload in segments):
-        return measure_girp(segments)
-    if any(marker == 0xE4 and payload.startswith(b"\xff\xd2\xd1\xffhirp")
-           for marker, payload in segments):
-        return measure_hirp(data)
-    if any(marker == 0xE4 and payload.startswith(b"\xaa\x55\x12\x06")
-           for marker, payload in segments):
-        return measure_dirp(segments)
-    return measure_iirp(data)
+    if XtsHandler.can_handle(segments):
+        return XtsHandler.get_instance().measure(segments)
+    if GirpHandler.can_handle(segments):
+        return GirpHandler.get_instance().measure(segments)
+    if HirpHandler.can_handle(segments):
+        return HirpHandler.get_instance().measure(data, segments)
+    if DirpHandler.can_handle(segments):
+        return DirpHandler.get_instance().measure(segments)
+    return IirpHandler.get_instance().measure(data, segments)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Measure DJI R-JPEG temperatures as float32.")
+    parser = argparse.ArgumentParser(
+        description="Measure DJI R-JPEG temperatures as float32."
+    )
     parser.add_argument("-s", required=True, type=Path, metavar="R-JPEG")
     parser.add_argument("-o", required=True, type=Path, metavar="RAW")
     parser.add_argument("-a", choices=["measure"], default="measure")
@@ -50,7 +42,7 @@ def main():
         temperatures, (height, width) = measure_float32(args.s.read_bytes())
         if sys.byteorder != "little":
             temperatures.byteswap()
-        args.o.write_bytes(temperatures)
+        args.o.write_bytes(temperatures.tobytes())
     except (OSError, ValueError) as exc:
         parser.exit(1, f"{exc}\n")
 
