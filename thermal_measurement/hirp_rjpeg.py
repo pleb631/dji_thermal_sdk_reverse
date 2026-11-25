@@ -9,6 +9,7 @@ from .hirp_fixed_point import (
     GrayCalibration,
     ObjectTemperatureCorrection,
     _truncate_division,
+    _VectorFallback,
     atmospheric_temperature_trim,
     atmospheric_transmission_q14,
     blackbody_gray,
@@ -55,6 +56,9 @@ class HirpHandler:
 
     _instance = None
 
+    def __init__(self):
+        self._lut = np.empty(1 << 16, dtype=np.float32)
+
     @classmethod
     def get_instance(cls) -> "HirpHandler":
         if cls._instance is None:
@@ -62,14 +66,14 @@ class HirpHandler:
         return cls._instance
 
     @staticmethod
-    def can_handle(segments: list[tuple[int, bytes]]) -> bool:
+    def can_handle(segments: list[tuple[int, bytes | memoryview]]) -> bool:
         return any(
-            marker == 0xE4 and payload.startswith(b"\xff\xd2\xd1\xffhirp")
+            marker == 0xE4 and payload[:8] == b"\xff\xd2\xd1\xffhirp"
             for marker, payload in segments
         )
 
     def measure(
-        self, data: bytes, segments: list[tuple[int, bytes]] | None = None
+        self, data: bytes, segments: list[tuple[int, bytes | memoryview]] | None = None
     ) -> tuple[ThermalArray, tuple[int, int]]:
         if segments is None:
             from .iirp_rjpeg import _jpeg_segments
@@ -83,7 +87,7 @@ class HirpHandler:
         for marker, payload in segments:
             if marker == 0xE3:
                 samples.extend(payload)
-            elif marker == 0xE4 and payload.startswith(b"\xff\xd2\xd1\xffhirp"):
+            elif marker == 0xE4 and payload[:8] == b"\xff\xd2\xd1\xffhirp":
                 headers.append(payload)
             elif marker == 0xE5:
                 calibration.extend(payload)
@@ -123,13 +127,18 @@ class HirpHandler:
             header, calibration, table, row, dj20, distance_cm
         )
 
-        # Fast NumPy array mapping via uint16 bincount unique extraction
+        # Map raw codes over the observed span instead of looping per unique value
         raw_pixels = np.frombuffer(samples, dtype="<u2")
-        unique_grays = np.flatnonzero(np.bincount(raw_pixels)).tolist()
-
-        lut = np.empty(65536, dtype=np.float32)
-        for gray in unique_grays:
-            lut[gray] = scale.temperature(gray, calib_obj)
+        low = int(raw_pixels.min())
+        high = int(raw_pixels.max())
+        codes = np.arange(low, high + 1, dtype=np.int64)
+        lut = self._lut
+        try:
+            lut[low : high + 1] = scale.temperature_array(codes, calib_obj)
+        except _VectorFallback:
+            unique_grays = np.flatnonzero(np.bincount(raw_pixels)).tolist()
+            for gray in unique_grays:
+                lut[gray] = scale.temperature(gray, calib_obj)
 
         temperatures = lut[raw_pixels]
         return temperatures.astype("<f4", copy=False).view(ThermalArray), (height, width)
@@ -355,7 +364,7 @@ class HirpHandler:
 
 
 def measure_hirp(
-    data: bytes, segments: list[tuple[int, bytes]] | None = None
+    data: bytes, segments: list[tuple[int, bytes | memoryview]] | None = None
 ) -> tuple[ThermalArray, tuple[int, int]]:
     """Measure Matrice 3TD / Matrice 4T HIRP R-JPEG using HirpHandler."""
     return HirpHandler.get_instance().measure(data, segments)

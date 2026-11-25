@@ -26,6 +26,7 @@ class XtsCalibration:
     def from_plug_and_lut(
         cls, plug_payload: bytes, lut: np.ndarray
     ) -> "XtsCalibration":
+        plug_payload = bytes(plug_payload)
         calibration = plug_payload[1178:1198] + plug_payload[1200:1260]
         words = np.frombuffer(calibration, dtype="<u2")
         signed_words = np.frombuffer(calibration, dtype="<i2")
@@ -86,6 +87,9 @@ class XtsHandler:
     HEIGHT = 512
     _instance = None
 
+    def __init__(self):
+        self._lut = np.empty(1 << 16, dtype=np.float32)
+
     @classmethod
     def get_instance(cls) -> "XtsHandler":
         if cls._instance is None:
@@ -93,19 +97,19 @@ class XtsHandler:
         return cls._instance
 
     @staticmethod
-    def can_handle(segments: list[tuple[int, bytes]]) -> bool:
+    def can_handle(segments: list[tuple[int, bytes | memoryview]]) -> bool:
         return any(
-            marker == 0xE2 and payload.startswith(b"Plug")
+            marker == 0xE2 and payload[:4] == b"Plug"
             for marker, payload in segments
         )
 
     def measure(
-        self, segments: list[tuple[int, bytes]]
+        self, segments: list[tuple[int, bytes | memoryview]]
     ) -> tuple[ThermalArray, tuple[int, int]]:
         plugs = [
             data
             for marker, data in segments
-            if marker == 0xE2 and data.startswith(b"Plug")
+            if marker == 0xE2 and data[:4] == b"Plug"
         ]
         raw_bytes = b"".join(data for marker, data in segments if marker == 0xE4)
         table_bytes = b"".join(data for marker, data in segments if marker == 0xE3)
@@ -122,9 +126,11 @@ class XtsHandler:
         raw_pixels = np.frombuffer(raw_bytes, dtype="<u2")
         calibration = XtsCalibration.from_plug_and_lut(plugs[0], lut)
 
-        # Vectorized temperature mapping via unique code LUT
-        unique_raws = np.flatnonzero(np.bincount(raw_pixels))
-        adjusted = (unique_raws.astype(np.int64) + calibration.raw_offset).astype(
+        # Vectorized temperature mapping over the observed raw code span
+        low = int(raw_pixels.min())
+        high = int(raw_pixels.max())
+        codes = np.arange(low, high + 1, dtype=np.uint16)
+        adjusted = (codes.astype(np.int64) + calibration.raw_offset).astype(
             np.int16
         )
         index_f = calibration.raw_scale * adjusted.astype(np.float64) + (
@@ -137,19 +143,19 @@ class XtsHandler:
             .astype(np.int16)
         )
         index = np.clip(index, 0, len(lut) - 1)
-        t_unique = (
+        t_span = (
             lut[index].astype(np.int32) + calibration.temperature_offset
         ).astype(np.int16).astype(np.float32) / 10.0
 
-        lut_full = np.empty(65536, dtype=np.float32)
-        lut_full[unique_raws] = t_unique
+        lut_full = self._lut
+        lut_full[low : high + 1] = t_span
         temperatures = lut_full[raw_pixels]
 
         return temperatures.astype("<f4", copy=False).view(ThermalArray), (self.HEIGHT, self.WIDTH)
 
 
 def measure_xts(
-    segments: list[tuple[int, bytes]],
+    segments: list[tuple[int, bytes | memoryview]],
 ) -> tuple[ThermalArray, tuple[int, int]]:
     """Measure Zenmuse XT S R-JPEG segments using XtsHandler."""
     return XtsHandler.get_instance().measure(segments)

@@ -151,6 +151,51 @@ def prepare_humidity_correction(
     return correct
 
 
+def prepare_humidity_correction_array(distance, humidity, ambient, version):
+    """Array form of :func:`prepare_humidity_correction` for a batch of temperatures."""
+    if version not in (1, 2, 3):
+        raise ValueError("Unknown IIRP humidity calibration version")
+    humidity, ambient, distance = map(_float32, (humidity, ambient, distance))
+    if not 0 <= humidity <= 1:
+        raise ValueError("Relative humidity must be between zero and one")
+
+    pressure = _float32(611.2 * exp(17.67 * (ambient / (243.5 + ambient))) * humidity)
+    pressure = min(max(pressure, 800), 3000 if version == 1 else 4000)
+    pressure_ratio = _float32(int(pressure) / 1425)
+
+    dist_eff = max(distance, 1)
+    if version != 1:
+        dist_eff = min(dist_eff, 10)
+    dist_log = 1.4427 * log(dist_eff)
+    scale = 0.6 if version == 2 else (0.3 if version == 3 else 1.0)
+
+    def correct(transmission, apparent_celsius):
+        kelvin = np.asarray(apparent_celsius, dtype=np.float64)
+        kelvin = (kelvin.astype(np.float32).astype(np.float64) + 273.15).astype(
+            np.float32
+        ).astype(np.float64)
+        with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+            cold = 0.01 * (np.power(410.15 / kelvin, 4.0) - 1.0) - 0.04
+            hot = -0.003 * (np.power(kelvin / 410.15, 4.0) - 1.0) - 0.04
+        coefficient = np.where(
+            kelvin < 273.15,
+            0.0,
+            np.where(kelvin >= 1273.1501, 0.0, np.where(kelvin < 410.15, cold, hot)),
+        )
+        coefficient = coefficient.astype(np.float32).astype(np.float64)
+        if version != 1:
+            coefficient = (coefficient * scale).astype(np.float32).astype(np.float64)
+        exponent = dist_log * coefficient
+        multiplier = np.power(pressure_ratio, exponent).astype(np.float32).astype(
+            np.float64
+        )
+        product = np.asarray(transmission, dtype=np.float64) * multiplier
+        product = product.astype(np.float32).astype(np.float64)
+        return np.trunc(product).astype(np.int64) & 0xFFFF
+
+    return correct
+
+
 class TransmissionTable:
     def __init__(self, calibration):
         has_header = calibration[4:8] == b"\xff" * 4
@@ -169,6 +214,8 @@ class TransmissionTable:
         self._columns = len(self._distances)
         self._temperature_index = tuple(map(_float32, self._temperatures))
         self._distance_index = tuple(map(_float32, self._distances))
+        self._temperatures_np = np.array(self._temperatures, dtype=np.float64)
+        self._temperature_index_np = np.array(self._temperature_index, dtype=np.float64)
         total_elements = len(self._temperatures) * self._columns
         if len(calibration) < offset + total_elements * 2:
             raise ValueError("Truncated IIRP transmission table")
@@ -228,6 +275,64 @@ class TransmissionTable:
                 + d * ((kelvin - t0) * dist_minus_d0 / area)
                 + 0.5
             )
+
+        return lookup
+
+    def lookup_at_distance_array(self, distance):
+        """Return a bound lookup function operating on temperature arrays."""
+        dist_f = _float32(distance)
+        column = max(0, bisect_right(self._distance_index, dist_f) - 1)
+        end_column = column == self._columns - 1
+        num_rows = len(self._temperatures)
+        temps = self._temperatures_np
+        t_index = self._temperature_index_np
+        grid = self._values.reshape(num_rows, self._columns)
+        first_column = grid[:, column].astype(np.float64)
+        last_row = num_rows - 1
+
+        if not end_column:
+            second_column = grid[:, column + 1].astype(np.float64)
+            d0, d1 = self._distances[column : column + 2]
+            d1_minus_dist = d1 - dist_f
+            dist_minus_d0 = dist_f - d0
+            d_span = d1 - d0
+
+        def lookup(apparent_celsius):
+            kelvin = np.asarray(apparent_celsius, dtype=np.float64)
+            kelvin = (kelvin.astype(np.float32).astype(np.float64) + 273.15).astype(
+                np.float32
+            ).astype(np.float64)
+            row = np.searchsorted(t_index, kelvin, side="right") - 1
+            np.maximum(row, 0, out=row)
+            end_row = row == last_row
+            next_row = np.minimum(row + 1, last_row)
+            a = first_column[row]
+            t0 = temps[row]
+            t1 = temps[next_row]
+            with np.errstate(divide="ignore", invalid="ignore"):
+                if end_column:
+                    c = first_column[next_row]
+                    interpolated = a * ((t1 - kelvin) / (t1 - t0)) + c * (
+                        (kelvin - t0) / (t1 - t0)
+                    )
+                    result = np.where(end_row, a, interpolated)
+                else:
+                    b = second_column[row]
+                    c = first_column[next_row]
+                    d = second_column[next_row]
+                    area = (t1 - t0) * d_span
+                    row_end = a * (d1_minus_dist / d_span) + a * (
+                        dist_minus_d0 / d_span
+                    )
+                    bilinear = (
+                        a * ((t1 - kelvin) * d1_minus_dist / area)
+                        + b * ((t1 - kelvin) * dist_minus_d0 / area)
+                        + c * ((kelvin - t0) * d1_minus_dist / area)
+                        + d * ((kelvin - t0) * dist_minus_d0 / area)
+                        + 0.5
+                    )
+                    result = np.where(end_row, row_end, bilinear)
+            return np.trunc(result).astype(np.int64)
 
         return lookup
 

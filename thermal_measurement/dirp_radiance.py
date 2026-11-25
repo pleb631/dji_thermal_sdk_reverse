@@ -23,6 +23,7 @@ class DirpCalibration:
 
     @classmethod
     def from_header_and_lut(cls, header: bytes, lut: np.ndarray) -> "DirpCalibration":
+        header = bytes(header)
         params = header[4:100] + b"".join(
             header[offset : offset + 4] for offset in (0x64, 0xA4, 0x88, 0xA8, 0x84)
         )
@@ -93,6 +94,9 @@ class DirpHandler:
     HEIGHT = 512
     _instance = None
 
+    def __init__(self):
+        self._lut = np.empty(1 << 16, dtype=np.float32)
+
     @classmethod
     def get_instance(cls) -> "DirpHandler":
         if cls._instance is None:
@@ -100,17 +104,17 @@ class DirpHandler:
         return cls._instance
 
     @staticmethod
-    def can_handle(segments: list[tuple[int, bytes]]) -> bool:
+    def can_handle(segments: list[tuple[int, bytes | memoryview]]) -> bool:
         return any(
-            marker == 0xE4 and payload.startswith(b"\xaa\x55\x12\x06")
+            marker == 0xE4 and payload[:4] == b"\xaa\x55\x12\x06"
             for marker, payload in segments
         )
 
     def measure(
-        self, segments: list[tuple[int, bytes]]
+        self, segments: list[tuple[int, bytes | memoryview]]
     ) -> tuple[ThermalArray, tuple[int, int]]:
         headers = [
-            p for m, p in segments if m == 0xE4 and p.startswith(b"\xaa\x55\x12\x06")
+            p for m, p in segments if m == 0xE4 and p[:4] == b"\xaa\x55\x12\x06"
         ]
         raw_bytes = b"".join(p for m, p in segments if m == 0xE3)
         lut_bytes = b"".join(p for m, p in segments if m == 0xE5)
@@ -127,10 +131,12 @@ class DirpHandler:
         raw_pixels = np.frombuffer(raw_bytes, dtype="<u2")
         calibration = DirpCalibration.from_header_and_lut(headers[0], lut)
 
-        # Vectorized DIRP radiance calculation via unique raw code LUT
-        unique_raws = np.flatnonzero(np.bincount(raw_pixels))
+        # Vectorized DIRP radiance calculation over the observed raw code span
+        low = int(raw_pixels.min())
+        high = int(raw_pixels.max())
+        codes = np.arange(low, high + 1, dtype=np.uint16)
         code = (
-            (unique_raws.astype(np.float32) - calibration.zero_code) * calibration.gain
+            (codes.astype(np.float32) - calibration.zero_code) * calibration.gain
         ).astype(np.float32)
         code = (code + calibration.reference_code).astype(np.float32)
         code = (code + calibration.offset).astype(np.float32)
@@ -164,15 +170,15 @@ class DirpHandler:
             scaled + np.float32(calibration.output_offset_tenths / 10.0)
         ).astype(np.float32)
 
-        lut_full = np.empty(65536, dtype=np.float32)
-        lut_full[unique_raws] = t_unique
+        lut_full = self._lut
+        lut_full[low : high + 1] = t_unique
         temperatures = lut_full[raw_pixels]
 
         return temperatures.astype("<f4", copy=False).view(ThermalArray), (self.HEIGHT, self.WIDTH)
 
 
 def measure_dirp(
-    segments: list[tuple[int, bytes]],
+    segments: list[tuple[int, bytes | memoryview]],
 ) -> tuple[ThermalArray, tuple[int, int]]:
     """Measure Zenmuse H20T R-JPEG segments using DirpHandler."""
     return DirpHandler.get_instance().measure(segments)

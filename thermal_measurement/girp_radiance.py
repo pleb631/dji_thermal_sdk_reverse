@@ -112,6 +112,7 @@ class GirpHandler:
         return cls._instance
 
     def __init__(self):
+        self._lut = np.empty(1 << 16, dtype=np.float32)
         if GirpHandler._tables is None:
             GirpHandler._load_tables()
 
@@ -122,19 +123,19 @@ class GirpHandler:
         cls._tables = {k: np.array(v, dtype=np.int16) for k, v in data.items()}
 
     @staticmethod
-    def can_handle(segments: list[tuple[int, bytes]]) -> bool:
+    def can_handle(segments: list[tuple[int, bytes | memoryview]]) -> bool:
         return any(
-            marker == 0xE4 and payload.startswith(b"\xff\xd2\xd1\xffgirp")
+            marker == 0xE4 and payload[:8] == b"\xff\xd2\xd1\xffgirp"
             for marker, payload in segments
         )
 
     def measure(
-        self, segments: list[tuple[int, bytes]]
+        self, segments: list[tuple[int, bytes | memoryview]]
     ) -> tuple[ThermalArray, tuple[int, int]]:
         headers = [
             p
             for m, p in segments
-            if m == 0xE4 and p.startswith(b"\xff\xd2\xd1\xffgirp")
+            if m == 0xE4 and p[:8] == b"\xff\xd2\xd1\xffgirp"
         ]
         raw_bytes = b"".join(p for m, p in segments if m == 0xE3)
 
@@ -154,10 +155,12 @@ class GirpHandler:
         )
         raw_pixels = np.frombuffer(raw_bytes, dtype="<i2")
 
-        # Vectorized GIRP temperature calculation via unique code LUT
-        unique_words = np.flatnonzero(np.bincount(raw_pixels.view("<u2")))
-        unique_raws = unique_words.astype("<u2").view("<i2").astype(np.int64)
-        unique_raws.sort()
+        # Vectorized GIRP temperature calculation over the observed raw code span
+        raw_words = raw_pixels.view(np.uint16)
+        low = int(raw_words.min())
+        high = int(raw_words.max())
+        codes = np.arange(low, high + 1, dtype=np.uint16)
+        unique_raws = codes.view("<i2").astype(np.int64)
         prod = unique_raws * calib.index_gain
         div = np.where(prod >= 0, prod // 8192, -(-prod // 8192))
         index_raw = div + calib.index_offset
@@ -192,15 +195,15 @@ class GirpHandler:
         )
         t_unique = ((scaled / 100.0).astype(np.float32) / 10.0).astype(np.float32)
 
-        lut_full = np.empty(65536, dtype=np.float32)
-        lut_full[unique_raws & 0xFFFF] = t_unique
-        temperatures = lut_full[raw_pixels.view(np.uint16)]
+        lut_full = self._lut
+        lut_full[codes] = t_unique
+        temperatures = lut_full[raw_words]
 
         return temperatures.astype("<f4", copy=False).view(ThermalArray), (self.HEIGHT, self.WIDTH)
 
 
 def measure_girp(
-    segments: list[tuple[int, bytes]],
+    segments: list[tuple[int, bytes | memoryview]],
 ) -> tuple[ThermalArray, tuple[int, int]]:
     """Measure Matrice 30T GIRP R-JPEG segments using GirpHandler."""
     return GirpHandler.get_instance().measure(segments)

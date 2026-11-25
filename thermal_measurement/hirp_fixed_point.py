@@ -294,6 +294,174 @@ def _lookup_square_root(value):
     return ((1 << exponent) * entry) >> 13
 
 
+# --- Vectorized fixed-point helpers -----------------------------------------
+#
+# The functions below mirror the scalar routines above elementwise. They are
+# used to fill the per-frame LUT over the observed raw code span, which avoids a
+# Python loop per distinct code. Overflow semantics intentionally match Python's
+# explicit 32/64-bit wrapping masks.
+
+_RECIPROCAL_BASES_NP = np.array(_RECIPROCAL_BASES, dtype=np.int64)
+_RECIPROCAL_SLOPES_NP = np.array(_RECIPROCAL_SLOPES, dtype=np.int64)
+_LOGARITHMS_NP = np.array(_LOGARITHMS, dtype=np.int64)
+_SQRT_VALUES_NP = np.array(_SQRT_VALUES, dtype=np.int64)
+_SQRT64_BASES_NP = np.array(_SQRT64_BASES, dtype=np.int64)
+_SQRT64_SLOPES_NP = np.array(_SQRT64_SLOPES, dtype=np.int64)
+_MASK32 = np.uint64(0xFFFFFFFF)
+_MASK64 = np.uint64(0xFFFFFFFFFFFFFFFF)
+
+
+class _VectorFallback(Exception):
+    """Raised when the vectorized path cannot reproduce the scalar semantics."""
+
+
+def _f32_array(values):
+    return np.asarray(values, dtype=np.float64).astype(np.float32).astype(np.float64)
+
+
+def _signed32_array(values):
+    low = values.astype(np.int64) & 0xFFFFFFFF
+    return (low ^ 0x80000000) - 0x80000000
+
+
+def _bit_length_array(values):
+    """floor(log2(value)) for an array of positive int64 values."""
+    work = values.astype(np.int64, copy=True)
+    highest = np.zeros(work.shape, dtype=np.int64)
+    for shift in (32, 16, 8, 4, 2, 1):
+        big = work >= (1 << shift)
+        highest += np.where(big, shift, 0)
+        work = np.where(big, np.right_shift(work, shift), work)
+    return highest
+
+
+def _shift_pair(values, left, right):
+    """``(values << left) >> right`` for nonnegative integer arrays."""
+    delta = left - right
+    positive = delta >= 0
+    return np.where(
+        positive,
+        np.left_shift(values, np.where(positive, delta, 0)),
+        np.right_shift(values, np.where(positive, 0, -delta)),
+    )
+
+
+def _square_root_64_array(values):
+    values = np.asarray(values, dtype=np.int64)
+    if np.any(values <= 0):
+        raise _VectorFallback
+    highest_bit = _bit_length_array(values)
+    wrapped = (values.astype(np.uint64) << np.uint64(20)).view(np.int64)
+    divisor = np.exp2((highest_bit + 1).astype(np.float64))
+    normalized = np.trunc(wrapped.astype(np.float64) / divisor).astype(np.int64)
+    bin_number = ((normalized - 0x7F000) >> 12) & 0xFF
+    if np.any((bin_number < 1) | (bin_number > 128)):
+        raise _VectorFallback
+    midpoint = (bin_number << 12) + 0x7F800
+    slope = _SQRT64_SLOPES_NP[bin_number - 1]
+    root = np.right_shift((normalized - midpoint) * slope, 17)
+    root = root + _SQRT64_BASES_NP[bin_number - 1] * 8
+    scaled = normalized << 22
+    threshold = root * root + root + 1
+    root = root + np.where(
+        scaled > threshold + root * 2 + 2, 2, np.where(scaled > threshold, 1, 0)
+    )
+    odd = ((highest_bit + 1) & 1).astype(bool)
+    odd_result = np.right_shift(root * 46341, 36 - (highest_bit >> 1))
+    even_exponent = (highest_bit + 1) >> 1
+    even_result = _shift_pair(root, even_exponent, 21)
+    return np.where(odd, odd_result, even_result)
+
+
+def _log_mantissa_array(values, highest_bit):
+    shift = highest_bit - 14
+    normalized = np.where(
+        shift >= 0,
+        np.right_shift(values, np.where(shift >= 0, shift, 0)),
+        np.left_shift(values, np.where(shift < 0, -shift, 0)),
+    )
+    return _LOGARITHMS_NP[(normalized - 16384) >> 4]
+
+
+def _reciprocal_product_array(numerator, denominator):
+    magnitude = np.abs(denominator)
+    exponent = _bit_length_array(magnitude)
+    normalized = np.right_shift(magnitude << 15, exponent)
+    index = (normalized - 32768) >> 7
+    midpoint = 32832 + (index << 7)
+    reciprocal = _RECIPROCAL_BASES_NP[index] + np.right_shift(
+        _RECIPROCAL_SLOPES_NP[index] * (midpoint - normalized), 15
+    )
+    refined = np.right_shift((2147483648 - normalized * reciprocal) * reciprocal, 15)
+    result = np.right_shift(refined * np.abs(numerator), exponent + 30)
+    negative = (numerator < 0) != (denominator < 0)
+    return np.where(negative, -result, result)
+
+
+def inverse_sensor_response_array(grays, coefficients):
+    """Array form of :func:`inverse_sensor_response`."""
+    base, temperature_scale, response_floor, response_slope = coefficients
+    grays = np.asarray(grays, dtype=np.int64)
+    scaled_gray = _signed32_array(grays << 8)
+    if np.any(scaled_gray <= response_floor):
+        raise _VectorFallback
+    response = _signed32_array(scaled_gray - response_floor)
+    floor_product = (
+        np.uint64(response_floor & 0xFFFFFFFF) * np.uint64(response_slope & 0xFFFFFFFF)
+    )
+    floor_term = _signed32_array((floor_product & _MASK32).astype(np.int64))
+    adjusted_base = _signed32_array(base - (floor_term >> 8))
+    gray_product = (grays.astype(np.uint64) & _MASK32) * np.uint64(
+        response_slope & 0xFFFFFFFF
+    )
+    adjusted_base = adjusted_base + _signed32_array(
+        (gray_product & _MASK32).astype(np.int64)
+    )
+    if np.any(adjusted_base <= 0) or np.any(adjusted_base < response):
+        raise _VectorFallback
+
+    base_bit = _bit_length_array(adjusted_base)
+    response_bit = _bit_length_array(response)
+    logarithm = (base_bit - response_bit) * 11356
+    logarithm = logarithm + _log_mantissa_array(adjusted_base, base_bit)
+    logarithm = logarithm - _log_mantissa_array(response, response_bit)
+    denominator = logarithm >> 2
+    if np.any(denominator == 0):
+        raise _VectorFallback
+    return _signed32_array(
+        _reciprocal_product_array(_signed32(temperature_scale << 6), denominator)
+    )
+
+
+def _fourth_power_q12_array(value):
+    if np.any(np.abs(value) >= (1 << 21)):
+        raise _VectorFallback
+    squared = np.right_shift(value * value, 12)
+    return np.right_shift(squared * squared, 12)
+
+
+def _lookup_square_root_array(values):
+    values = np.asarray(values, dtype=np.int64)
+    if np.any(values <= 0):
+        raise _VectorFallback
+    highest_bit = _bit_length_array(values)
+    scaled = values.astype(np.uint64) << np.uint64(12)
+    high = (scaled >> np.uint64(63)) != 0
+    numerator = np.where(
+        high,
+        (scaled >> np.uint64(1)).astype(np.float64) * 2.0,
+        scaled.astype(np.float64),
+    )
+    divisor = np.exp2((highest_bit + 1).astype(np.float64))
+    normalized = np.trunc(numerator / divisor).astype(np.int64)
+    index = (((normalized + 0x3FF800) << 15) & 0xFFFFFFFF) >> 16
+    entry = _SQRT_VALUES_NP[index]
+    odd = ((highest_bit + 1) & 1).astype(bool)
+    odd_result = _shift_pair(entry * 11585, highest_bit >> 1, 26)
+    even_result = _shift_pair(entry, (highest_bit + 1) >> 1, 13)
+    return np.where(odd, odd_result, even_result)
+
+
 @dataclass(frozen=True)
 class ObjectTemperatureCorrection:
     """Prepared coefficients for MicroTA's blackbody-to-object transform."""
@@ -334,6 +502,25 @@ class ObjectTemperatureCorrection:
         root = _lookup_square_root(adjusted)
         kelvin_q8 = _lookup_square_root(root << 6) << 2
         return _signed32(kelvin_q8 - 0x11126)
+
+    def apply_array(self, blackbody_q12):
+        """Array form of :meth:`apply`."""
+        shifted = _signed32_array(np.asarray(blackbody_q12, dtype=np.int64) + 0x111266)
+        radiance = np.right_shift(
+            _fourth_power_q12_array(shifted) * self.radiance_gain_q12, 12
+        )
+        radiance = radiance + self.radiance_offset_q12
+        if np.any(
+            ((radiance.astype(np.uint64) << np.uint64(11)) & _MASK64) == 0
+        ):
+            raise _VectorFallback
+        gain = (1 << 26) // self.throughput_q14
+        adjusted = np.right_shift(
+            radiance.astype(np.uint64) * np.uint64(gain), np.uint64(12)
+        ).astype(np.int64)
+        root = _lookup_square_root_array(adjusted)
+        kelvin_q8 = np.left_shift(_lookup_square_root_array(np.left_shift(root, 6)), 2)
+        return _signed32_array(kelvin_q8 - 0x11126)
 
 
 @dataclass(frozen=True)
@@ -378,6 +565,29 @@ class GrayCalibration:
         corrected = _signed64(((root << 12) - self.linear_response) * multiplier)
         return _signed32(corrected >> 33)
 
+    def response_array(self, raws):
+        """Array form of :meth:`response`."""
+        raws = np.asarray(raws, dtype=np.int64)
+        gray = _signed32_array(raws - self.gray_offset)
+        if self.quadratic_response >> 9 == 0:
+            multiplier = int(float(1 << 46) / self.linear_response)
+            product = (gray.astype(np.uint64) & _MASK32) * np.uint64(
+                multiplier & 0xFFFFFFFF
+            )
+            return (
+                _signed32_array((product & _MASK32).astype(np.int64)) >> 14
+            )
+
+        linear = self.linear_response >> 5
+        discriminant = gray * (self.quadratic_response << 2)
+        deterministic = linear * linear
+        deterministic = ((deterministic + (1 << 63)) & 0xFFFFFFFFFFFFFFFF) - (1 << 63)
+        discriminant = discriminant + (np.int64(deterministic) >> 22)
+        root = _square_root_64_array(discriminant << 8)
+        multiplier = int(float(1 << 32) / self.quadratic_response)
+        corrected = ((root << 12) - self.linear_response) * multiplier
+        return _signed32_array(corrected >> 33)
+
     def temperature_q6(self, raw):
         """Convert a raw gray code to the native per-pixel Q6 temperature."""
         kelvin_q8 = inverse_sensor_response(
@@ -396,6 +606,32 @@ class GrayCalibration:
             if (object_q8 >> 8) <= 500:
                 trim = _signed32((temperature - 0x5D00) * trim) >> 13
             temperature = _signed32(temperature + trim)
+        return temperature
+
+    def temperature_q6_array(self, raws):
+        """Array form of :meth:`temperature_q6`."""
+        kelvin_q8 = inverse_sensor_response_array(
+            self.response_array(raws), self.inverse_coefficients
+        )
+        blackbody_q8 = np.clip(
+            kelvin_q8 - 0x11126, self.minimum_q8, self.maximum_q8
+        )
+        object_q8 = self.object_correction.apply_array(blackbody_q8 << 4)
+        if self.trim_gain_q23 is not None:
+            object_q8 = _signed32_array(
+                np.right_shift(object_q8 * self.trim_gain_q23, 23)
+                + self.trim_offset_q8
+            )
+        temperature = object_q8 >> 2
+        high = (object_q8 >> 8) > 371
+        middle = (object_q8 >> 8) <= 500
+        trimmed = _signed32_array(
+            (temperature - 0x5D00) * self.high_temperature_trim
+        ) >> 13
+        offset = np.where(middle, trimmed, self.high_temperature_trim)
+        temperature = np.where(
+            high, _signed32_array(temperature + offset), temperature
+        )
         return temperature
 
 
@@ -447,3 +683,26 @@ class FrameTemperatureScale:
                 max(q13, self.minimum_temperature_q13), self.maximum_temperature_q13
             )
         return _float32(q13 / 8192)
+
+    def temperature_array(self, raws, calibration):
+        """Array form of :meth:`temperature`."""
+        raws = np.asarray(raws, dtype=np.int64)
+        below = raws < self.minimum_gray
+        above = raws > self.maximum_gray
+        inside = ~(below | above)
+        values = np.empty(raws.shape, dtype=np.float32)
+        if np.any(inside):
+            q6 = calibration.temperature_q6_array(raws[inside])
+            tenths = np.trunc(
+                _f32_array(_f32_array(q6.astype(np.float64) / 64.0) * 10.0)
+            ).astype(np.int64)
+            q13 = np.trunc(
+                _f32_array(_f32_array(tenths.astype(np.float64) / 10.0) * 8192.0)
+            ).astype(np.int64)
+            q13 = np.clip(
+                q13, self.minimum_temperature_q13, self.maximum_temperature_q13
+            )
+            values[inside] = (q13.astype(np.float64) / 8192.0).astype(np.float32)
+        values[below] = np.float32(self.minimum_temperature_q13 / 8192)
+        values[above] = np.float32(self.maximum_temperature_q13 / 8192)
+        return values
