@@ -123,16 +123,16 @@ class HirpHandler:
             header, calibration, table, row, dj20, distance_cm
         )
 
-        # Fast NumPy array mapping
+        # Fast NumPy array mapping via uint16 bincount unique extraction
         raw_pixels = np.frombuffer(samples, dtype="<u2")
-        unique_grays = np.unique(raw_pixels)
+        unique_grays = np.flatnonzero(np.bincount(raw_pixels)).tolist()
 
         lut = np.empty(65536, dtype=np.float32)
         for gray in unique_grays:
-            lut[gray] = scale.temperature(int(gray), calib_obj)
+            lut[gray] = scale.temperature(gray, calib_obj)
 
         temperatures = lut[raw_pixels]
-        return temperatures.astype("<f4").view(ThermalArray), (height, width)
+        return temperatures.astype("<f4", copy=False).view(ThermalArray), (height, width)
 
     def _prepare_scale(
         self,

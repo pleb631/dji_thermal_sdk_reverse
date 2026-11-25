@@ -122,8 +122,9 @@ class XtsHandler:
         raw_pixels = np.frombuffer(raw_bytes, dtype="<u2")
         calibration = XtsCalibration.from_plug_and_lut(plugs[0], lut)
 
-        # Vectorized temperature mapping
-        adjusted = (raw_pixels.astype(np.int64) + calibration.raw_offset).astype(
+        # Vectorized temperature mapping via unique code LUT
+        unique_raws = np.flatnonzero(np.bincount(raw_pixels))
+        adjusted = (unique_raws.astype(np.int64) + calibration.raw_offset).astype(
             np.int16
         )
         index_f = calibration.raw_scale * adjusted.astype(np.float64) + (
@@ -136,11 +137,15 @@ class XtsHandler:
             .astype(np.int16)
         )
         index = np.clip(index, 0, len(lut) - 1)
-        temperatures = (
+        t_unique = (
             lut[index].astype(np.int32) + calibration.temperature_offset
         ).astype(np.int16).astype(np.float32) / 10.0
 
-        return temperatures.astype("<f4").view(ThermalArray), (self.HEIGHT, self.WIDTH)
+        lut_full = np.empty(65536, dtype=np.float32)
+        lut_full[unique_raws] = t_unique
+        temperatures = lut_full[raw_pixels]
+
+        return temperatures.astype("<f4", copy=False).view(ThermalArray), (self.HEIGHT, self.WIDTH)
 
 
 def measure_xts(

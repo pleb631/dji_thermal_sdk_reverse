@@ -127,9 +127,10 @@ class DirpHandler:
         raw_pixels = np.frombuffer(raw_bytes, dtype="<u2")
         calibration = DirpCalibration.from_header_and_lut(headers[0], lut)
 
-        # Vectorized DIRP radiance calculation
+        # Vectorized DIRP radiance calculation via unique raw code LUT
+        unique_raws = np.flatnonzero(np.bincount(raw_pixels))
         code = (
-            (raw_pixels.astype(np.float32) - calibration.zero_code) * calibration.gain
+            (unique_raws.astype(np.float32) - calibration.zero_code) * calibration.gain
         ).astype(np.float32)
         code = (code + calibration.reference_code).astype(np.float32)
         code = (code + calibration.offset).astype(np.float32)
@@ -159,11 +160,15 @@ class DirpHandler:
         scaled = (
             (celsius * calibration.output_gain_percent).astype(np.float32) / 100.0
         ).astype(np.float32)
-        temperatures = (
+        t_unique = (
             scaled + np.float32(calibration.output_offset_tenths / 10.0)
         ).astype(np.float32)
 
-        return temperatures.astype("<f4").view(ThermalArray), (self.HEIGHT, self.WIDTH)
+        lut_full = np.empty(65536, dtype=np.float32)
+        lut_full[unique_raws] = t_unique
+        temperatures = lut_full[raw_pixels]
+
+        return temperatures.astype("<f4", copy=False).view(ThermalArray), (self.HEIGHT, self.WIDTH)
 
 
 def measure_dirp(

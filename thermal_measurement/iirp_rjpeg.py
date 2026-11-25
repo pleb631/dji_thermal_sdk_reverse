@@ -9,7 +9,7 @@ import numpy as np
 from .iirp_emissivity import lookup_emissivity
 from .iirp_transmission import (
     TransmissionTable,
-    correct_humidity,
+    prepare_humidity_correction,
     restore_legacy_m2ea_calibration,
 )
 from .xts_radiance import ThermalArray
@@ -127,14 +127,14 @@ class IirpHandler:
         if segments is None:
             segments = list(_jpeg_segments(data))
 
-        samples = bytearray()
+        sample_chunks = []
         header = None
         legacy_header = None
         calibration = bytearray()
 
         for marker, payload in segments:
             if marker == 0xE3:
-                samples.extend(payload)
+                sample_chunks.append(payload)
             elif marker == 0xE4 and payload.startswith(b"\xff\xd2\xd1\xffiirp"):
                 if header is not None:
                     raise ValueError("Multiple IIRP headers")
@@ -167,11 +167,12 @@ class IirpHandler:
         else:
             raise ValueError("Missing or truncated IIRP header")
 
+        samples = b"".join(sample_chunks)
         if width == 0 or height == 0 or len(samples) != 2 * width * height:
             raise ValueError("IIRP dimensions do not match the thermal payload")
 
         raw_words = np.frombuffer(samples, dtype="<u2")
-        raw_values = (raw_words >> 2).astype(np.uint16)
+        raw_values = raw_words >> 2
 
         return IirpFrame(
             width, height, raw_values, measurement_fields, bytes(calibration)
@@ -221,37 +222,40 @@ class IirpHandler:
         ambient, distance, emissivity, humidity, reflection = frame.measurement_fields
         reflected = reflection if reflection_enabled == 1 else None
 
-        # Vectorized mapping over unique raw codes
-        unique_raws = np.unique(frame.raw_values)
-        lut = np.empty(65536, dtype=np.float32)
+        # Pre-bind distance-interpolated transmission lookup and humidity correction
+        table_lookup = table.lookup_at_distance(distance)
+        if humidity_enabled == 1:
+            correct_hum = prepare_humidity_correction(
+                distance, humidity, ambient, humidity_version
+            )
+
+        # The decoder shifts away two bits, leaving a 14-bit raw code.
+        unique_raws = np.flatnonzero(np.bincount(frame.raw_values)).tolist()
+        lut = np.empty(1 << 14, dtype=np.float32)
+        active_emissivity_version = emissivity_version if emissivity_enabled == 1 else 0
 
         for raw in unique_raws:
             apparent = _float32(raw / 16.0 - _KELVIN_OFFSET)
             effective = lookup_emissivity(
                 apparent,
                 emissivity,
-                emissivity_version if emissivity_enabled == 1 else 0,
+                active_emissivity_version,
             )
-            transmission = table.lookup(apparent, distance)
+            initial_transmission = table_lookup(apparent)
             estimate = correct_temperature(
-                apparent, effective, transmission, ambient, reflected
+                apparent, effective, initial_transmission, ambient, reflected
             )
-            transmission = table.lookup(estimate, distance)
+            transmission = table_lookup(estimate)
             if humidity_enabled == 1:
-                transmission = correct_humidity(
-                    transmission,
-                    estimate,
-                    distance,
-                    humidity,
-                    ambient,
-                    humidity_version,
+                transmission = correct_hum(transmission, estimate)
+            if transmission != initial_transmission:
+                estimate = correct_temperature(
+                    apparent, effective, transmission, ambient, reflected
                 )
-            lut[raw] = correct_temperature(
-                apparent, effective, transmission, ambient, reflected
-            )
+            lut[raw] = estimate
 
         temperatures = lut[frame.raw_values]
-        return temperatures.astype("<f4").view(ThermalArray), (
+        return temperatures.astype("<f4", copy=False).view(ThermalArray), (
             frame.height,
             frame.width,
         )

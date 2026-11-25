@@ -152,10 +152,13 @@ class GirpHandler:
         calib = GirpCalibration.from_calibration_payload(
             calibration_payload, self._tables
         )
-        raw_pixels = np.frombuffer(raw_bytes, dtype="<i2").astype(np.int64)
+        raw_pixels = np.frombuffer(raw_bytes, dtype="<i2")
 
-        # Vectorized GIRP temperature calculation
-        prod = raw_pixels * calib.index_gain
+        # Vectorized GIRP temperature calculation via unique code LUT
+        unique_words = np.flatnonzero(np.bincount(raw_pixels.view("<u2")))
+        unique_raws = unique_words.astype("<u2").view("<i2").astype(np.int64)
+        unique_raws.sort()
+        prod = unique_raws * calib.index_gain
         div = np.where(prod >= 0, prod // 8192, -(-prod // 8192))
         index_raw = div + calib.index_offset
         index = ((index_raw + 32768) & 0xFFFF) - 32768
@@ -187,9 +190,13 @@ class GirpHandler:
         scaled = ((temperature.astype(np.float32) + correction) * 100.0).astype(
             np.float32
         )
-        temperatures = ((scaled / 100.0).astype(np.float32) / 10.0).astype(np.float32)
+        t_unique = ((scaled / 100.0).astype(np.float32) / 10.0).astype(np.float32)
 
-        return temperatures.astype("<f4").view(ThermalArray), (self.HEIGHT, self.WIDTH)
+        lut_full = np.empty(65536, dtype=np.float32)
+        lut_full[unique_raws & 0xFFFF] = t_unique
+        temperatures = lut_full[raw_pixels.view(np.uint16)]
+
+        return temperatures.astype("<f4", copy=False).view(ThermalArray), (self.HEIGHT, self.WIDTH)
 
 
 def measure_girp(

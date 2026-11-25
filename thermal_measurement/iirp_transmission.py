@@ -114,6 +114,43 @@ def correct_humidity(
     return int(_float32(transmission * multiplier)) & 0xFFFF
 
 
+def prepare_humidity_correction(
+    distance: float, humidity: float, ambient: float, version: int
+):
+    """Precompute constant environmental factors for humidity correction."""
+    if version not in (1, 2, 3):
+        raise ValueError("Unknown IIRP humidity calibration version")
+    humidity, ambient, distance = map(_float32, (humidity, ambient, distance))
+    if not 0 <= humidity <= 1:
+        raise ValueError("Relative humidity must be between zero and one")
+
+    pressure = _float32(611.2 * exp(17.67 * (ambient / (243.5 + ambient))) * humidity)
+    pressure = min(max(pressure, 800), 3000 if version == 1 else 4000)
+    pressure_ratio = _float32(int(pressure) / 1425)
+
+    dist_eff = max(distance, 1)
+    if version != 1:
+        dist_eff = min(dist_eff, 10)
+    dist_log = 1.4427 * log(dist_eff)
+    scale = 0.6 if version == 2 else (0.3 if version == 3 else 1.0)
+
+    def correct(transmission: int, apparent_celsius: float) -> int:
+        kelvin = _float32(_float32(apparent_celsius) + 273.15)
+        if kelvin < 273.15 or kelvin >= 1273.1501:
+            coefficient = 0.0
+        elif kelvin < 410.15:
+            coefficient = _float32(0.01 * (pow(410.15 / kelvin, 4) - 1) - 0.04)
+        else:
+            coefficient = _float32(-0.003 * (pow(kelvin / 410.15, 4) - 1) - 0.04)
+        if version != 1:
+            coefficient = _float32(coefficient * scale)
+        exponent = dist_log * coefficient
+        multiplier = _float32(pow(pressure_ratio, exponent))
+        return int(_float32(transmission * multiplier)) & 0xFFFF
+
+    return correct
+
+
 class TransmissionTable:
     def __init__(self, calibration):
         has_header = calibration[4:8] == b"\xff" * 4
@@ -138,6 +175,61 @@ class TransmissionTable:
         self._values = np.frombuffer(
             calibration, dtype="<u2", count=total_elements, offset=offset
         )
+
+    def lookup_at_distance(self, distance: float):
+        """Return a bound lookup function with distance weights precalculated."""
+        dist_f = _float32(distance)
+        column = max(0, bisect_right(self._distance_index, dist_f) - 1)
+        end_column = column == self._columns - 1
+        cols = self._columns
+        temps = self._temperatures
+        t_index = self._temperature_index
+        num_rows = len(temps)
+        grid = self._values.reshape(num_rows, cols)
+        # Only these columns contribute. Use Python integers in the scalar
+        # loop so each term still multiplies by a double without NumPy dispatch.
+        first_column = grid[:, column].tolist()
+
+        if not end_column:
+            second_column = grid[:, column + 1].tolist()
+            d0, d1 = self._distances[column : column + 2]
+            d1_minus_dist = d1 - dist_f
+            dist_minus_d0 = dist_f - d0
+            d_span = d1 - d0
+
+        def lookup(apparent_celsius: float) -> int:
+            kelvin = _float32(_float32(apparent_celsius) + 273.15)
+            row = max(0, bisect_right(t_index, kelvin) - 1)
+            end_row = row == num_rows - 1
+
+            a = first_column[row]
+            if end_row and end_column:
+                return grid[row, column]
+            if end_row:
+                return int(
+                    a * (d1_minus_dist / d_span) + a * (dist_minus_d0 / d_span)
+                )
+            if end_column:
+                t0, t1 = temps[row : row + 2]
+                c = first_column[row + 1]
+                return int(
+                    a * ((t1 - kelvin) / (t1 - t0)) + c * ((kelvin - t0) / (t1 - t0))
+                )
+
+            t0, t1 = temps[row : row + 2]
+            b = second_column[row]
+            c = first_column[row + 1]
+            d = second_column[row + 1]
+            area = (t1 - t0) * d_span
+            return int(
+                a * ((t1 - kelvin) * d1_minus_dist / area)
+                + b * ((t1 - kelvin) * dist_minus_d0 / area)
+                + c * ((kelvin - t0) * d1_minus_dist / area)
+                + d * ((kelvin - t0) * dist_minus_d0 / area)
+                + 0.5
+            )
+
+        return lookup
 
     def lookup(self, apparent_celsius, distance):
         """Interpolate the transmission represented as an unsigned Q14 value."""

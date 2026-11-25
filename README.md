@@ -23,20 +23,20 @@
 ## ⚡ 性能与分机型测温耗时
 
 基于官方 SDK 1.8 全部 49 个官方 R-JPEG 样本库进行基准测试（纯内存解析与解算，预热后 5 轮采样）：
-- **全样本平均耗时**：**~15.8 ms / 张**（约 63 FPS）
-- **端到端测试耗时**：约 **0.8 秒** 完成 49 张图像的读取、解算与 SHA-256 位级校验
+- **全样本平均耗时**：**~9.5 ms / 张**（达 **105 FPS**）
+- **端到端测试耗时**：约 **0.6 秒** 完成 49 张图像的读取、解算与 SHA-256 位级校验
 
 | 相机机型 | 对应协议 | 典型分辨率 | 单张平均耗时 | 官方样本数 |
 | :--- | :--- | :--- | :--- | :--- |
-| **Matrice 3TD** | HIRP / IIRP | 640 × 512 | **6.90 ms** | 10 |
-| **Zenmuse XT S** | XT S | 640 × 512 | **9.72 ms** | 5 |
-| **Matrice 4T** | HIRP / IIRP | 640 × 512 | **10.65 ms** | 5 |
-| **Zenmuse H20N** | IIRP | 640 × 512 | **11.04 ms** | 5 |
-| **Matrice 3T** | IIRP | 640 × 512 | **11.55 ms** | 5 |
-| **Mavic 2 EA** | IIRP | 640 × 512 | **14.18 ms** | 5 |
-| **Zenmuse H20T** | DIRP | 640 × 512 | **29.66 ms** | 4 |
-| **Matrice 30T** | GIRP / IIRP | 1280 × 1024 | **29.83 ms** | 5 |
-| **Zenmuse H30T** | IIRP | 1280 × 1024 | **29.95 ms** | 5 |
+| **Zenmuse XT S** | XT S | 640 × 512 | **2.95 ms** | 5 |
+| **Matrice 30T** | GIRP / IIRP | 640 × 512 | **4.29 ms** | 5 |
+| **Matrice 3TD** | HIRP / IIRP | 640 × 512 | **5.64 ms** | 10 |
+| **Zenmuse H20T** | DIRP | 640 × 512 | **6.66 ms** | 4 |
+| **Matrice 4T** | HIRP / IIRP | 640 × 512 | **9.96 ms** | 5 |
+| **Matrice 3T** | IIRP | 640 × 512 | **10.07 ms** | 5 |
+| **Zenmuse H20N** | IIRP | 640 × 512 | **10.36 ms** | 5 |
+| **Mavic 2 EA** | IIRP | 640 × 512 | **12.25 ms** | 5 |
+| **Zenmuse H30T** | IIRP | 1280 × 1024 | **27.00 ms** | 5 |
 
 ---
 
@@ -72,9 +72,16 @@ python -m thermal_measurement.radiometry -s input_R.jpg -o output.raw -a measure
 
 ---
 
-## 🧪 运行测试
+## 🧪 运行测试与基准测速
 
+### 单元与位级回归测试
 ```bash
 python -m unittest discover -s tests -v
 ```
 包含官方 SDK 1.8 全部 49 个 R-JPEG 样本的位级回归测试（SHA-256 校验）。
+
+### 性能基准测试
+```bash
+python benchmark.py --runs 5
+```
+自动遍历官方测试集样本，统计总体平均延迟、吞吐率 (FPS) 以及各机型协议的耗时报表。
