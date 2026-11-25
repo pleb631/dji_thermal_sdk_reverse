@@ -33,20 +33,30 @@ def correct_temperature(
     apparent = _float32(apparent)
     emissivity = _float32(emissivity)
     ambient = _float32(ambient)
+    received = pow(_float32(apparent + _KELVIN_OFFSET), 4)
+    air = pow(ambient + _KELVIN_OFFSET, 4)
+    reflected_radiance = (
+        None if reflected is None else pow(_float32(reflected) + _KELVIN_OFFSET, 4)
+    )
+    return _correct_radiance(received, emissivity, transmission, air, reflected_radiance)
+
+
+def _correct_radiance(
+    received: float,
+    emissivity: float,
+    transmission: int,
+    air: float,
+    reflected_radiance: float | None,
+) -> float:
     if not 0 < transmission <= 0xFFFF or not 0 < emissivity <= 1:
         raise ValueError("Invalid IIRP transmission or emissivity")
 
-    received = pow(_float32(apparent + _KELVIN_OFFSET), 4)
-    air = pow(ambient + _KELVIN_OFFSET, 4)
     throughput = transmission * emissivity
-    if reflected is None:
+    if reflected_radiance is None:
         received -= air * (1.0 - throughput / _TRANSMISSION_SCALE)
     else:
-        refl = _float32(reflected)
         reflected_weight = (1.0 - emissivity) * transmission
-        received -= (
-            pow(refl + _KELVIN_OFFSET, 4) * reflected_weight / _TRANSMISSION_SCALE
-        )
+        received -= reflected_radiance * reflected_weight / _TRANSMISSION_SCALE
         received -= air * (1.0 - transmission / _TRANSMISSION_SCALE)
 
     divisor = _float32(_float32(throughput) / _TRANSMISSION_SCALE)
@@ -220,7 +230,10 @@ class IirpHandler:
             raise ValueError("Unsupported IIRP reflection calibration")
 
         ambient, distance, emissivity, humidity, reflection = frame.measurement_fields
-        reflected = reflection if reflection_enabled == 1 else None
+        air = pow(ambient + _KELVIN_OFFSET, 4)
+        reflected_radiance = (
+            pow(reflection + _KELVIN_OFFSET, 4) if reflection_enabled == 1 else None
+        )
 
         # Pre-bind distance-interpolated transmission lookup and humidity correction
         table_lookup = table.lookup_at_distance(distance)
@@ -230,31 +243,32 @@ class IirpHandler:
             )
 
         # The decoder shifts away two bits, leaving a 14-bit raw code.
-        unique_raws = np.flatnonzero(np.bincount(frame.raw_values)).tolist()
+        # Both bincount and LUT indexing use native-sized indices.
+        raw_indices = frame.raw_values.astype(np.intp, copy=False)
+        unique_raws = np.flatnonzero(np.bincount(raw_indices)).tolist()
         lut = np.empty(1 << 14, dtype=np.float32)
         active_emissivity_version = emissivity_version if emissivity_enabled == 1 else 0
 
         for raw in unique_raws:
             apparent = _float32(raw / 16.0 - _KELVIN_OFFSET)
-            effective = lookup_emissivity(
-                apparent,
-                emissivity,
-                active_emissivity_version,
+            effective = _float32(
+                lookup_emissivity(apparent, emissivity, active_emissivity_version)
             )
             initial_transmission = table_lookup(apparent)
-            estimate = correct_temperature(
-                apparent, effective, initial_transmission, ambient, reflected
+            received = pow(_float32(apparent + _KELVIN_OFFSET), 4)
+            estimate = _correct_radiance(
+                received, effective, initial_transmission, air, reflected_radiance
             )
             transmission = table_lookup(estimate)
             if humidity_enabled == 1:
                 transmission = correct_hum(transmission, estimate)
             if transmission != initial_transmission:
-                estimate = correct_temperature(
-                    apparent, effective, transmission, ambient, reflected
+                estimate = _correct_radiance(
+                    received, effective, transmission, air, reflected_radiance
                 )
             lut[raw] = estimate
 
-        temperatures = lut[frame.raw_values]
+        temperatures = lut[raw_indices]
         return temperatures.astype("<f4", copy=False).view(ThermalArray), (
             frame.height,
             frame.width,
